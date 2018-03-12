@@ -2,9 +2,24 @@
 namespace EvesAddiction\Filestack;
 
 class Policy {
-  protected $calls = [];
-  protected $expires;
+  const ALLOWED_KEYS = [
+    'call', 'container', 'expiry', 'handle',
+    'maxSize', 'minSize', 'path', 'url'
+  ];
+
+  const VALID_CALLS = [
+    'convert', 'exif', 'pick', 'read', 'remove',
+    'stat', 'store', 'write', 'writeUrl',
+  ];
+
+  protected $call;
+  protected $container;
+  protected $expiry;
+  protected $handle;
+  protected $maxSize;
+  protected $minSize;
   protected $path;
+  protected $url;
 
   protected $_policy;
   protected $_base64;
@@ -15,24 +30,26 @@ class Policy {
   /**
    * Represents a filepicker Policy for access and request signing
    *
-   * @param array              $calls
-   * @param \DateTimeInterface $expires
-   * @param string             $path
-   * @param string|null        $secret
+   * @param array $policyData
    */
-  public function __construct(array $calls, \DateTimeInterface $expires, $path = '.*', $secret = null) {
-    $this->calls = $calls;
-    $this->expires = $expires instanceof \DateTimeImmutable ? $expires : \DateTimeImmutable::createFromMutable($expires);
-    $this->path = $path;
-    $this->_secret = $secret;
+  public function __construct(array $policyData) {
+    foreach ($policyData as $option => $value) {
+      if ($option == 'expiry') {
+        $value = static::makeDateTimeImmutable($value);
+      }
 
-    $this->_policy = [ 'expiry' => $expires->getTimestamp(),
-      'calls'  => $calls,
-    ];
+      $validOption = static::validateOption($option, $value, $exception);
 
-    if (strlen($path)) {
-      $this->_policy['path'] = $path;
+      if ($validOption === true) {
+        $this->{$option} = $value;
+      } elseif ($exception instanceof PolicyException) {
+        throw $exception;
+      } else {
+        throw new \RuntimeException('Unknown validation error');
+      }
     }
+
+    $this->_policy = $policyData;
   }
 
   /**
@@ -42,7 +59,7 @@ class Policy {
    */
   public function getBase64() {
     if (!isset($this->_base64)) {
-      $this->_base64 = static::makeBase64($this->_policy);
+      $this->_base64 = static::makeBase64(json_encode($this->_policy));
     }
 
     return $this->_base64;
@@ -53,7 +70,8 @@ class Policy {
    *
    * @return string The signature
    */
-  public function getSignature() {
+  public function getSignature($secret) {
+    $this->_secret = $secret;
     if (!isset($this->_signature)) {
       $this->_signature = static::makeSignature($this->getBase64(), $this->_secret);
     }
@@ -61,8 +79,8 @@ class Policy {
     return $this->_signature;
   }
 
-  public function getExpires() {
-    return $this->expires;
+  public function getExpiry() {
+    return $this->expiry;
   }
 
   /**
@@ -72,12 +90,12 @@ class Policy {
    *
    * @return \DateInterval           The interval from $now when the policy will expire
    */
-  public function getExpiresInterval(\DateTimeInterface $now = null) {
+  public function getExpiryInterval(\DateTimeInterface $now = null) {
     if (is_null($now)) {
       $now = new \DateTimeImmutable();
     }
 
-    return $now->diff($this->expires);
+    return $now->diff($this->expiry);
   }
 
   /**
@@ -91,7 +109,7 @@ class Policy {
       $now = new \DateTimeImmutable();
     }
 
-    return $now >= $this->expires;
+    return $now >= $this->expiry;
   }
 
   /**
@@ -108,14 +126,18 @@ class Policy {
     }
 
     if ($time_or_interval instanceof \DateTimeInterface) {
-      $expires = $time_or_interval;
+      $expiry = $time_or_interval;
     } elseif ($time_or_interval instanceof \DateInterval) {
-      $expires = $now->add($time_or_interval);
+      $expiry = $now->add($time_or_interval);
     } else {
       throw new \InvalidArgumentException('Need some sort of date-y, time-y object');
     }
 
-    return new Policy($this->calls, $expires, $this->_path, $this->_secret);
+    if (!isset($this->_secret)) {
+      throw new PolicyException("This policy hasn't been signed yet, so it can't be renewed!");
+    }
+
+    return new Policy($this->call, $expiry, $this->_path, $this->_secret);
   }
 
   public function signUrl($url) {}
@@ -134,7 +156,7 @@ class Policy {
       $policy = $policy->_policy;
     }
 
-    return str_replace(array('+', '/'), array('-', '_'), base64_encode(json_encode($policy)));
+    return str_replace(array('+', '/'), array('-', '_'), base64_encode($policy));
   }
 
   /**
@@ -155,5 +177,71 @@ class Policy {
     }
 
     return hash_hmac('sha256', $base64, $secret);
+  }
+
+  public static function validateOption($option, $value, &$exception = null) {
+    $exception = null; // in case a non-null value gets passed in
+
+    if (!in_array($option, static::ALLOWED_KEYS)) {
+      $exception = new PolicyException(sprintf('Invalid security policy option: "%s" is not one of %s', $option, implode(', ', static::ALLOWED_KEYS)));
+      return false;
+    }
+
+    switch ($option) {
+      case 'call':
+        if (!is_array($value)) {
+          $exception = new PolicyException('Invalid security policy allowed calls: "call" option must be an array');
+        } else {
+          $invalid_calls = array_diff((array) $value, static::VALID_CALLS);
+          if (count($invalid_calls)) {
+            $exception = new PolicyException(sprintf('Invalid security policy allowed calls: %s', implode(', ', $invalid_calls)));
+          }
+        }
+        break;
+      case 'expiry':
+        if ($value instanceof \DateTimeInterface) {} else {
+          $exception = new PolicyException('Invalid security policy expiry: must be \DateTimeInterface or date_parse()-able string');
+        }
+        break;
+    }
+
+    return is_null($exception) ? true : false;
+  }
+
+  /**
+   * Tries to create a \DateTimeImmutable from a given input
+   *
+   * @param mixed $maybeDate Something that might be a date
+   *
+   * @throws PolicyException
+   *
+   * @return \DateTimeImmutable
+   */
+  public static function makeDateTimeImmutable($maybeDate) {
+    switch (true) {
+      case $maybeDate instanceof \DateTimeImmutable:
+        $result = $maybeDate;
+        break;
+      case $maybeDate instanceof \DateTime:
+        $result = \DateTimeImmutable::createFromMutable($maybeDate);
+        break;
+      case is_numeric($maybeDate) && $maybeDate >= 0:
+        $result = new \DateTimeImmutable(sprintf('@%d', $maybeDate));
+        break;
+      default:
+        try {
+          $result = new \DateTimeImmutable($maybeDate);
+        } catch (\Exception $e) {
+          // The DateTime and DateTimeImmutable unhelpfully throw generic \Exception-s
+          throw new PolicyException($e->getMessage(), $e->getCode(), $e);
+        }
+        break;
+    }
+
+    if (!isset($result)) {
+      throw new PolicyException("Unknown issue parsing datetime");
+    }
+
+    return $result;
   }
 }

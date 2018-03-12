@@ -2,6 +2,7 @@
     "name": "eves/filestack",
     "description": "Classes for interacting with the Filestack API",
     "type": "library",
+    "require": {},
     "require-dev": {
         "phpunit/phpunit": "^5.7"
     },
@@ -15,6 +16,5 @@
             "email": "john@evesaddiction.com"
         }
     ],
-    "minimum-stability": "stable",
-    "require": {}
+    "minimum-stability": "stable"
 }
